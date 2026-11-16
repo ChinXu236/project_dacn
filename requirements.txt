@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+torch
+torch-geometric
+networkx
+pyvis
+streamlit
+python-pptx
+PyMuPDF
