@@ -25,12 +25,18 @@ def _hash_password(password: str) -> str:
 
 
 def register_user(username: str, password: str) -> int:
-    with get_connection() as con:
-        cur = con.execute(
-            "INSERT INTO users(username, password_hash) VALUES (?, ?)",
-            (username.strip(), _hash_password(password)),
-        )
-        return cur.lastrowid
+    clean_username = username.strip()
+    if not clean_username or not password:
+        raise ValueError("Tên đăng nhập và mật khẩu không được để trống.")
+    try:
+        with get_connection() as con:
+            cur = con.execute(
+                "INSERT INTO users(username, password_hash) VALUES (?, ?)",
+                (clean_username, _hash_password(password)),
+            )
+            return cur.lastrowid
+    except sqlite3.IntegrityError as exc:
+        raise ValueError(f"Tên đăng nhập '{clean_username}' đã tồn tại.") from exc
 
 
 def authenticate_user(username: str, password: str) -> Optional[int]:
@@ -64,26 +70,42 @@ def get_all_concepts() -> List[Dict]:
 
 
 def get_diagnostic_test(limit_per_concept: int = 1, include_answer: bool = False) -> List[Dict]:
-    """Lấy bộ câu hỏi chẩn đoán đầu vào phủ đều 27 khái niệm."""
+    """Lấy bộ câu hỏi chẩn đoán đầu vào phủ đều 27 khái niệm (tránh trùng câu giữa các concept)."""
+    if limit_per_concept <= 0:
+        return []
+
     cols = "q.question_id, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.difficulty"
     if include_answer:
         cols += ", q.correct_answer"
 
-    selected = {}
+    selected: Dict[str, Dict] = {}
     with get_connection() as con:
         concepts = [r["concept_id"] for r in con.execute("SELECT concept_id FROM concepts ORDER BY concept_id")]
         for cid in concepts:
-            rows = con.execute(
-                f"""
-                SELECT {cols}
-                FROM questions q
-                JOIN question_concept_map m ON q.question_id = m.question_id
-                WHERE m.concept_id = ?
-                ORDER BY m.weight DESC, RANDOM()
-                LIMIT ?
-                """,
-                (cid, limit_per_concept),
-            ).fetchall()
+            exclude_ids = list(selected.keys())
+            if exclude_ids:
+                placeholders = ",".join(["?"] * len(exclude_ids))
+                sql = f"""
+                    SELECT {cols}
+                    FROM questions q
+                    JOIN question_concept_map m ON q.question_id = m.question_id
+                    WHERE m.concept_id = ? AND q.question_id NOT IN ({placeholders})
+                    ORDER BY m.weight DESC, RANDOM()
+                    LIMIT ?
+                """
+                params = [cid, *exclude_ids, limit_per_concept]
+            else:
+                sql = f"""
+                    SELECT {cols}
+                    FROM questions q
+                    JOIN question_concept_map m ON q.question_id = m.question_id
+                    WHERE m.concept_id = ?
+                    ORDER BY m.weight DESC, RANDOM()
+                    LIMIT ?
+                """
+                params = [cid, limit_per_concept]
+
+            rows = con.execute(sql, params).fetchall()
             for r in rows:
                 selected[r["question_id"]] = dict(r)
     return list(selected.values())
@@ -96,6 +118,9 @@ def get_review_questions(
     include_answer: bool = False,
 ) -> List[Dict]:
     """Lọc câu hỏi ôn tập theo danh sách concept yếu (từ GNN) và độ khó."""
+    if limit <= 0:
+        return []
+
     cols = "DISTINCT q.question_id, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.difficulty"
     if include_answer:
         cols += ", q.correct_answer"
@@ -173,7 +198,6 @@ def grade_submission(
         total = len(details)
         score_10 = round((correct_count / total) * 10.0, 2) if total > 0 else 0.0
 
-        # Tính điểm thành thạo sơ bộ (0.0 - 1.0) theo trọng số weight của từng concept
         concept_weighted_earned = {}
         concept_weighted_total = {}
         detail_lookup = {d["question_id"]: (1.0 if d["is_correct"] else 0.0) for d in details}
@@ -192,7 +216,6 @@ def grade_submission(
             if concept_weighted_total[cid] > 0
         }
 
-        # Lưu vào database nếu truyền session_id
         if session_id is not None:
             con.execute(
                 "UPDATE test_sessions SET submitted_at = CURRENT_TIMESTAMP, score = ? WHERE session_id = ?",
@@ -231,15 +254,22 @@ def save_gnn_mastery_scores(session_id: int, gnn_scores: Dict[str, float]) -> No
 # 4. TRÍCH XUẤT NGUỒN TÀI LIỆU THAM KHẢO (SLIDE & GIÁO TRÌNH TỪ DOC_INDEX.JSON)
 # ==============================================================================
 
-def _parse_page_numbers(page_str: str) -> List[int]:
+def _parse_page_numbers(page_str: Optional[str]) -> List[int]:
+    if not page_str:
+        return []
     cleaned = re.sub(r"\(.*?\)", "", str(page_str))
     pages = []
     for part in cleaned.split(","):
         part = part.strip()
+        if not part:
+            continue
         if "-" in part:
-            a, b = part.split("-", 1)
-            if a.strip().isdigit() and b.strip().isdigit():
-                pages.extend(range(int(a), int(b) + 1))
+            bounds = part.split("-", 1)
+            a_str, b_str = bounds[0].strip(), bounds[1].strip()
+            if a_str.isdigit() and b_str.isdigit():
+                a, b = int(a_str), int(b_str)
+                if a <= b:
+                    pages.extend(range(a, b + 1))
         elif part.isdigit():
             pages.append(int(part))
     return sorted(set(pages))
@@ -248,8 +278,33 @@ def _parse_page_numbers(page_str: str) -> List[int]:
 def _load_doc_index() -> Dict[tuple, str]:
     if not DOC_INDEX_PATH.exists():
         return {}
-    raw = json.loads(DOC_INDEX_PATH.read_text(encoding="utf-8"))
-    return {(item["file"], int(item["page"])): item["text"] for item in raw}
+    try:
+        raw = json.loads(DOC_INDEX_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return {}
+        index = {}
+        for item in raw:
+            if isinstance(item, dict) and "file" in item and "page" in item:
+                index[(str(item["file"]), int(item["page"]))] = str(item.get("text", ""))
+        return index
+    except (json.JSONDecodeError, ValueError, TypeError, OSError):
+        return {}
+
+
+def _extract_excerpts(
+    doc_map: Dict[tuple, str],
+    file_name: Optional[str],
+    pages_label: Optional[str],
+    max_excerpt_chars: int,
+) -> List[Dict]:
+    if not file_name or not pages_label:
+        return []
+    pages = _parse_page_numbers(pages_label)
+    return [
+        {"page": p, "text": doc_map[(file_name, p)][:max_excerpt_chars]}
+        for p in pages
+        if (file_name, p) in doc_map
+    ]
 
 
 def get_concept_references(concept_id: str, max_excerpt_chars: int = 600) -> Optional[Dict]:
@@ -278,19 +333,13 @@ def get_concept_references(concept_id: str, max_excerpt_chars: int = 600) -> Opt
 
     doc_map = _load_doc_index()
 
-    slide_pages = _parse_page_numbers(concept["slide_pages"])
-    slide_excerpts = [
-        {"page": p, "text": doc_map.get((concept["slide_file"], p), "")[:max_excerpt_chars]}
-        for p in slide_pages
-        if (concept["slide_file"], p) in doc_map
-    ]
+    slide_file = concept.get("slide_file") or ""
+    slide_pages_label = concept.get("slide_pages") or ""
+    slide_excerpts = _extract_excerpts(doc_map, slide_file, slide_pages_label, max_excerpt_chars)
 
-    textbook_pages = _parse_page_numbers(concept["textbook_pages"])
-    textbook_excerpts = [
-        {"page": p, "text": doc_map.get((concept["textbook_file"], p), "")[:max_excerpt_chars]}
-        for p in textbook_pages
-        if (concept["textbook_file"], p) in doc_map
-    ]
+    textbook_file = concept.get("textbook_file") or ""
+    textbook_pages_label = concept.get("textbook_pages") or ""
+    textbook_excerpts = _extract_excerpts(doc_map, textbook_file, textbook_pages_label, max_excerpt_chars)
 
     return {
         "concept_id": concept["concept_id"],
@@ -299,13 +348,13 @@ def get_concept_references(concept_id: str, max_excerpt_chars: int = 600) -> Opt
         "description": concept["description"],
         "prerequisites": prereqs,
         "slide": {
-            "file": concept["slide_file"],
-            "pages_label": concept["slide_pages"],
+            "file": slide_file,
+            "pages_label": slide_pages_label,
             "excerpts": slide_excerpts,
         },
         "textbook": {
-            "file": concept["textbook_file"],
-            "pages_label": concept["textbook_pages"],
+            "file": textbook_file,
+            "pages_label": textbook_pages_label,
             "excerpts": textbook_excerpts,
         },
     }
@@ -325,18 +374,43 @@ def get_question_references(question_id: str) -> List[Dict]:
 # KIỂM THỬ NHANH KHI CHẠY TRỰC TIẾP FILE
 # ==============================================================================
 if __name__ == "__main__":
-    print("1. Test lọc câu hỏi ôn tập cho C08 (Đường găng CPM):")
-    qs = get_review_questions(concept_ids=["C08"], limit=3, include_answer=True)
-    for q in qs:
-        print(f"   - {q['question_id']} [{q['difficulty']}]: {q['question_text'][:60]}... -> Đáp án: {q['correct_answer']}")
+    import sys
 
-    print("\n2. Test chấm điểm giả lập:")
-    sample_answers = {q["question_id"]: q["correct_answer"] for q in qs}
-    res = grade_submission(sample_answers)
-    print(f"   - Điểm: {res['score_10']}/10 | Concept scores: {res['concept_scores']}")
+    if "--quiz" in sys.argv:
+        sid = start_test_session()
+        qs = get_review_questions(limit=20)
+        ans = {}
 
-    print("\n3. Test trích xuất nguồn tài liệu cho C08:")
-    ref = get_concept_references("C08")
-    print(f"   - {ref['concept_name']} | Slide: {ref['slide']['file']} (tr.{ref['slide']['pages_label']}) | Giáo trình: {ref['textbook']['file']} (tr.{ref['textbook']['pages_label']})")
-    if ref["slide"]["excerpts"]:
-        print(f"   - Trích đoạn slide trang {ref['slide']['excerpts'][0]['page']}: {ref['slide']['excerpts'][0]['text'][:120]}...")
+        print(f"=== BẮT ĐẦU BÀI TEST (Session #{sid} - {len(qs)} Câu) ===")
+        for i, q in enumerate(qs, 1):
+            print(f"\nCâu {i} [{q['question_id']}] ({q['difficulty']}): {q['question_text']}")
+            print(f"  A. {q['option_a']}")
+            print(f"  B. {q['option_b']}")
+            print(f"  C. {q['option_c']}")
+            print(f"  D. {q['option_d']}")
+            ans[q["question_id"]] = input("Chọn đáp án (A/B/C/D): ").strip().upper()
+
+        res = grade_submission(ans, session_id=sid)
+        print(f"\n=== KẾT QUẢ: {res['score_10']}/10 ({res['correct_count']}/{len(qs)} câu đúng) ===")
+        for d in res["details"]:
+            if not d["is_correct"]:
+                refs = get_question_references(d["question_id"])
+                ref_str = ", ".join(
+                    f"{r['concept_name']} ({r['slide']['file']} tr.{r['slide']['pages_label']})"
+                    for r in refs
+                )
+                print(f"- Sai {d['question_id']} (Chọn {d['chosen']}, Đúng: {d['correct_answer']}) -> Ôn lại: {ref_str}")
+    else:
+        print("1. Test lọc câu hỏi ôn tập cho C08 (Đường găng CPM):")
+        qs = get_review_questions(concept_ids=["C08"], limit=3, include_answer=True)
+        for q in qs:
+            print(f"   - {q['question_id']} [{q['difficulty']}]: {q['question_text'][:60]}... -> Đáp án: {q['correct_answer']}")
+
+        print("\n2. Test chấm điểm giả lập:")
+        sample_answers = {q["question_id"]: q["correct_answer"] for q in qs}
+        res = grade_submission(sample_answers)
+        print(f"   - Điểm: {res['score_10']}/10 | Concept scores: {res['concept_scores']}")
+
+        print("\n3. Test trích xuất nguồn tài liệu cho C08:")
+        ref = get_concept_references("C08")
+        print(f"   - {ref['concept_name']} | Slide: {ref['slide']['file']} (tr.{ref['slide']['pages_label']}) | Giáo trình: {ref['textbook']['file']} (tr.{ref['textbook']['pages_label']})")
