@@ -1,0 +1,3 @@
+data_pipeline/database.db
+data_pipeline/doc_index.json
+__pycache__/
