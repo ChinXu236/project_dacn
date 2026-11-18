@@ -44,11 +44,18 @@ def main():
     edges_df = pd.read_csv(os.path.join(DATA_DIR, "edges.csv"))
     test_df = pd.read_csv(TEST_FILE)
 
-    q_cols = [f"Q{i:02d}" for i in range(1, len(questions_df) + 1)]
-    c_cols = [f"C{i:02d}" for i in range(1, len(concepts_df) + 1)]
+    # Lấy động toàn bộ danh sách câu hỏi (Q01 -> Q120) và concepts (C01 -> C27)
+    q_cols = questions_df["question_id"].tolist()
+    c_cols = concepts_df["concept_id"].tolist()
     c_to_idx = {cid: i for i, cid in enumerate(c_cols)}
     c_name_map = dict(zip(concepts_df["concept_id"], concepts_df["concept_name"]))
     test_edges_df = edges_df[edges_df["relation"] == "tests"]
+
+    # Tự động bổ sung các cột câu hỏi mới (Q31 -> Q120) với giá trị 0.5 (Chưa làm)
+    missing_q_cols = [q for q in q_cols if q not in test_df.columns]
+    if missing_q_cols:
+        missing_df = pd.DataFrame(0.5, index=test_df.index, columns=missing_q_cols)
+        test_df = pd.concat([test_df, missing_df], axis=1)
 
     # Lọc hồ sơ hợp lệ
     valid_rows = [row for _, row in test_df.iterrows() if not np.all(row[q_cols].values.astype(float) == 0.5)]
@@ -95,7 +102,7 @@ def main():
     ])
 
     print("=" * 78)
-    print("BẢNG 1: ĐÁNH GIÁ CHẨN ĐOÁN LỖ HỔNG TRÊN 30 HỒ SƠ KỊCH BẢN (PERSONA)")
+    print(f"BẢNG 1: ĐÁNH GIÁ CHẨN ĐOÁN LỖ HỔNG TRÊN 30 PERSONA (ĐỒ THỊ {len(q_cols)} CÂU HỎI)")
     print("=" * 78)
     print(persona_metrics_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
@@ -126,7 +133,7 @@ def main():
             masked_gat_prob.append(predict_question_score_from_mastery(gat_partial_scores, mq, test_edges_df, c_to_idx))
             masked_base_prob.append(predict_question_score_from_mastery(base_partial_scores, mq, test_edges_df, c_to_idx))
 
-        # Chẩn đoán toàn bài 20 câu cho báo cáo chi tiết
+        # Chẩn đoán toàn bài cho báo cáo chi tiết
         full_gat_dict = gat_predictor.predict(full_ans)
         red_concepts = [f"{c} ({c_name_map[c]}: {full_gat_dict[c]:.2f})"
                         for c in c_cols if full_gat_dict[c] < 0.5]

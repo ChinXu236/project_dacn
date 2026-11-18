@@ -12,8 +12,8 @@ def main():
 
     # Lấy dữ liệu của sinh viên thật REAL_09 (Tuyết Nhi)
     student = test_df[test_df["case_id"] == "REAL_09"].iloc[0]
-    q_cols = [f"Q{i:02d}" for i in range(1, 31)]
-    ans_dict = {q: float(student[q]) for q in q_cols}
+    q_cols = questions_df["question_id"].tolist()
+    ans_dict = {q: float(student[q]) if q in student else 0.5 for q in q_cols}
 
     predictor = GNNMasteryPredictor()
     scores, (att_edge_index, att_weights) = predictor.predict(ans_dict, return_attention=True)
