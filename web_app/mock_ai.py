@@ -1,9 +1,11 @@
 import os
 import sys
+import pandas as pd
 
-# Thêm đường dẫn thư mục model_gnn để import được inference.py và gnn_model.py
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT_DIR, "model_gnn")
+SHARE_DATA_DIR = os.path.join(ROOT_DIR, "share_data")
+
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
@@ -15,7 +17,7 @@ def run_gnn_diagnosis(grade_details: list[dict]) -> dict[str, float]:
     Chuyển đổi kết quả chấm điểm từng câu từ database.py sang đầu vào cho mô hình GAT.
     - Câu trả lời đúng -> 1.0
     - Câu trả lời sai -> 0.0
-    - Các câu chưa làm (trong kho 120 câu) -> mặc định 0.5 trong inference.py
+    - Các câu chưa làm -> mặc định 0.5 trong inference.py
     """
     student_answers = {}
     for item in grade_details:
@@ -25,15 +27,36 @@ def run_gnn_diagnosis(grade_details: list[dict]) -> dict[str, float]:
     return predict_mastery(student_answers)
 
 
-def get_demo_mastery_scores() -> dict[str, float]:
-    """Dữ liệu mô phỏng nhanh cho chế độ Demo trên giao diện"""
-    demo_answers = {
-        "Q01": 1.0, "Q02": 1.0, "Q03": 1.0, "Q04": 1.0,
-        "Q05": 0.0, "Q06": 1.0, "Q07": 0.0, "Q08": 0.0,
-        "Q09": 1.0, "Q10": 1.0, "Q11": 0.0, "Q12": 0.0,
-        "Q13": 1.0, "Q14": 1.0, "Q15": 1.0, "Q16": 1.0,
-        "Q17": 1.0, "Q18": 1.0, "Q19": 1.0, "Q20": 1.0,
-        "Q21": 0.0, "Q22": 0.0, "Q23": 1.0, "Q24": 1.0,
-        "Q25": 1.0, "Q26": 1.0, "Q27": 1.0,
-    }
-    return predict_mastery(demo_answers)
+def build_demo_user_answers(questions: list[dict]) -> dict[str, str]:
+    """
+    Tạo bộ đáp án mẫu trực quan cho danh sách câu hỏi đang mở trên Tab 1:
+    - Cố tình làm SAI các câu thuộc cụm kiến thức trọng tâm: C05 (WBS), C08 (CPM), C12 (EVM), C21 (Rủi ro)
+    - BỎ TRỐNG 5 câu cuối để minh họa khả năng suy luận dữ liệu khuyết của GAT
+    - Làm ĐÚNG các câu còn lại
+    """
+    edges_df = pd.read_csv(os.path.join(SHARE_DATA_DIR, "edges.csv"))
+    questions_df = pd.read_csv(os.path.join(SHARE_DATA_DIR, "questions.csv"))
+
+    test_edges = edges_df[edges_df["relation"] == "tests"]
+    q_to_concepts = test_edges.groupby("source_id")["target_id"].apply(set).to_dict()
+    q_to_correct = dict(zip(questions_df["question_id"], questions_df["correct_answer"]))
+
+    weak_targets = {"C05", "C08", "C12", "C21"}
+    demo_answers = {}
+
+    # Bỏ trống 5 câu cuối cùng của đề để test khả năng suy luận câu chưa làm
+    active_questions = questions[:-5] if len(questions) > 15 else questions
+
+    for q in active_questions:
+        qid = q["question_id"]
+        correct_opt = q_to_correct.get(qid, "A")
+        linked_concepts = q_to_concepts.get(qid, set())
+
+        if linked_concepts & weak_targets:
+            # Chọn 1 đáp án sai khác với đáp án đúng
+            wrong_opt = next(opt for opt in ["A", "B", "C", "D"] if opt != correct_opt)
+            demo_answers[qid] = wrong_opt
+        else:
+            demo_answers[qid] = correct_opt
+
+    return demo_answers

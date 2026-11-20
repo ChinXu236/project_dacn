@@ -8,3 +8,4 @@ pyvis
 streamlit
 python-pptx
 PyMuPDF
+streamlit-pdf
